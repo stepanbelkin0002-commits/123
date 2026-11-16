@@ -9,7 +9,7 @@ from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
 from channel_setup import (ChannelJob, SetupStopped, archive_other_dialogs,
-                           ensure_channel, run_configured_setup)
+                           ensure_channel, leave_unavailable_channels, run_configured_setup)
 from main import Settings
 
 
@@ -59,6 +59,7 @@ class FakeChannelClient:
         self.options = kwargs
         self.archived_ids = set()
         self.folder_edits = []
+        self.left_ids = []
         self.privacy = types.GlobalPrivacySettings(
             archive_and_mute_new_noncontact_peers=False, keep_archived_unmuted=False,
             keep_archived_folders=False, hide_read_marks=True,
@@ -77,6 +78,8 @@ class FakeChannelClient:
     async def iter_dialogs(self, **kwargs):
         items = self.channels[:kwargs["limit"]]
         for item in items:
+            if kwargs.get("ignore_migrated") and isinstance(item, types.Chat) and item.migrated_to:
+                continue
             if kwargs.get("folder") == 0 and __import__("telethon").utils.get_peer_id(item) in self.archived_ids:
                 continue
             yield SimpleNamespace(entity=item)
@@ -92,6 +95,14 @@ class FakeChannelClient:
             self.folder_edits.append(peer_id)
 
     async def __call__(self, request):
+        if isinstance(request, functions.channels.LeaveChannelRequest):
+            target_id = request.channel.channel_id
+            target = next(item for item in self.channels if item.id == target_id)
+            if not isinstance(target, types.ChannelForbidden):
+                raise AssertionError("Must not leave accessible private channels")
+            self.channels.remove(target)
+            self.left_ids.append(target_id)
+            return SimpleNamespace()
         if isinstance(request, functions.account.GetGlobalPrivacySettingsRequest):
             return self.privacy
         if isinstance(request, functions.account.SetGlobalPrivacySettingsRequest):
@@ -169,6 +180,15 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         result = await ensure_channel(client, job(), emit=lambda _: None, now=lambda: NOW)
         self.assertEqual(client.created, 0)
         self.assertEqual(result["channel_id"], managed.id)
+
+    async def test_existing_channel_is_recovered_outside_creation_time_window(self):
+        client = FakeChannelClient()
+        managed = channel(date=NOW - timedelta(days=2), username="che_tam_cheboksary")
+        client.channels = [managed]
+        client.descriptions[managed.id] = ABOUT
+        result = await ensure_channel(client, job(allow_create=False, existing_channel_id=managed.id),
+                                      emit=lambda _: None, now=lambda: NOW)
+        self.assertFalse(result["created"])
 
     async def test_recovery_reuses_private_channel_after_partial_creation(self):
         client = FakeChannelClient()
@@ -250,6 +270,50 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         second = await archive_other_dialogs(client, job(), 1001, emit=lambda _: None, now=lambda: NOW)
         self.assertEqual(second["archived"], 0)
         self.assertTrue(second["verified"])
+
+    async def test_migrated_group_placeholders_are_not_main_list_dialogs(self):
+        client = FakeChannelClient()
+        ghost = types.Chat(id=888, title="Migrated placeholder", photo=types.ChatPhotoEmpty(),
+                           participants_count=1, date=NOW, version=1,
+                           migrated_to=types.InputChannel(889, 123))
+        client.channels = [channel(1001), ghost]
+        result = await archive_other_dialogs(client, job(), 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["archived"], 0)
+
+    async def test_only_inaccessible_channels_are_left(self):
+        client = FakeChannelClient()
+        managed = channel(1001)
+        accessible_private = channel(1002, title="Accessible private channel", creator=False)
+        forbidden = types.ChannelForbidden(id=1003, access_hash=123, title="Unavailable", broadcast=True)
+        person = types.User(id=5004, first_name="Personal contact", access_hash=123)
+        client.channels = [managed, accessible_private, forbidden, person]
+        result = await leave_unavailable_channels(client, job(), 1001,
+                                                  emit=lambda _: None, now=lambda: NOW)
+        self.assertTrue(result["verified"])
+        self.assertEqual(client.left_ids, [1003])
+        self.assertIn(accessible_private, client.channels)
+        self.assertIn(person, client.channels)
+
+    async def test_combined_setup_leaves_forbidden_and_archives_personal_dialog(self):
+        flow, events, clients = FakeFlow(), [], []
+
+        def factory(*args, **kwargs):
+            client = FakeChannelClient(*args, **kwargs)
+            client.channels = [types.ChannelForbidden(id=3001, access_hash=123, title="Unavailable", broadcast=True),
+                               types.User(id=3002, first_name="Personal contact", access_hash=123)]
+            clients.append(client)
+            return client
+
+        await run_configured_setup(json.dumps(job_data(archive_existing_dialogs=True, leave_unavailable_channels=True)),
+                                   flow, decrypt=lambda *_: test_session(), client_factory=factory,
+                                   sleep=no_sleep, emit=events.append, now=lambda: NOW)
+        result = events[-1]
+        self.assertEqual(result["phase"], "done")
+        self.assertTrue(result["archive"]["verified"])
+        self.assertEqual(result["archive"]["personal_dialogs_archived"], 1)
+        self.assertEqual(result["unavailable_channels"]["left"], 1)
+        self.assertNotIn("Personal contact", json.dumps(events))
 
     async def test_keep_archive_changes_only_the_requested_archive_flag(self):
         client = FakeChannelClient()

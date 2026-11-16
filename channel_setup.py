@@ -6,6 +6,7 @@ account session, access hash, password, phone number or private invite link.
 """
 
 import asyncio
+from collections import Counter
 from copy import copy
 from datetime import datetime, timedelta, timezone
 import json
@@ -31,8 +32,10 @@ class ChannelJob(BaseModel):
     created_after: AwareDatetime
     expires_at: AwareDatetime
     allow_create: bool = True
+    existing_channel_id: int | None = Field(default=None, gt=0)
     archive_existing_dialogs: bool = False
     keep_archived_on_new_messages: bool = True
+    leave_unavailable_channels: bool = False
 
     @field_validator("username_candidates")
     @classmethod
@@ -50,6 +53,8 @@ class ChannelJob(BaseModel):
             raise ValueError("Invalid execution window")
         if self.title.strip() != self.title or not self.title.strip():
             raise ValueError("Invalid title")
+        if self.existing_channel_id is not None and self.allow_create:
+            raise ValueError("Existing-channel commands must not create another channel")
         return self
 
 
@@ -79,6 +84,8 @@ def recent_owned_broadcast(channel, job):
         return False
     if not channel.creator or not channel.broadcast or channel.title != job.title:
         return False
+    if job.existing_channel_id is not None:
+        return channel.id == job.existing_channel_id
     date = channel.date
     if date.tzinfo is None:
         date = date.replace(tzinfo=timezone.utc)
@@ -167,7 +174,7 @@ async def ensure_channel(client, job, *, emit=report, now=utc_now):
 
 async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, now=utc_now):
     """Archive main-list dialogs while keeping the newly created channel visible."""
-    archived = 0
+    moved = {}
     failed = {}
     retention_enabled = False
     retention_notice = None
@@ -189,7 +196,20 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
                 and dialog.entity.id == keep_channel_id)
 
     async def main_dialogs():
-        return [dialog async for dialog in client.iter_dialogs(folder=0, limit=None)]
+        return [dialog async for dialog in client.iter_dialogs(folder=0, limit=None, ignore_migrated=True)]
+
+    def peer_kind(peer):
+        if isinstance(peer, types.User):
+            if getattr(peer, "self", False):
+                return "saved_messages"
+            if peer.id == 777000:
+                return "telegram_service"
+            return "bot" if peer.bot else "personal_dialog"
+        if isinstance(peer, types.ChannelForbidden):
+            return "unavailable_channel"
+        if isinstance(peer, types.Channel):
+            return "group" if peer.megagroup else "channel"
+        return "group"
 
     bad_peer_errors = (errors.ChannelInvalidError, errors.ChannelPrivateError,
                        errors.ChatIdInvalidError, errors.FolderIdInvalidError,
@@ -206,23 +226,58 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
             batch = targets[offset:offset + 50]
             try:
                 await client.edit_folder(batch, folder=1)
-                archived += len(batch)
+                moved.update({utils.get_peer_id(peer): peer_kind(peer) for peer in batch})
             except bad_peer_errors:
                 # A single unsupported/system peer must not block all other dialogs.
                 for peer in batch:
                     try:
                         await client.edit_folder(peer, folder=1)
-                        archived += 1
+                        moved[utils.get_peer_id(peer)] = peer_kind(peer)
                     except bad_peer_errors as exc:
                         kind = "saved_messages" if getattr(peer, "self", False) else "unsupported_peer"
                         failed[utils.get_peer_id(peer)] = {"kind": kind, "reason": type(exc).__name__}
-            emit({"job_id": job.job_id, "phase": "archiving", "archived": archived,
+            emit({"job_id": job.job_id, "phase": "archiving", "archived": len(moved),
                   "unsupported": len(failed)})
 
     remaining = [dialog for dialog in await main_dialogs() if not keep(dialog)]
-    return {"archived": archived, "remaining": len(remaining), "verified": not remaining,
+    remaining_ids = {utils.get_peer_id(dialog.entity) for dialog in remaining}
+    confirmed = {peer_id: kind for peer_id, kind in moved.items() if peer_id not in remaining_ids}
+    remaining_kinds = dict(Counter(peer_kind(dialog.entity) for dialog in remaining))
+    return {"archived": len(confirmed), "remaining": len(remaining), "verified": not remaining,
+            "personal_dialogs_archived": sum(kind == "personal_dialog" for kind in confirmed.values()),
+            "remaining_personal_dialogs": remaining_kinds.get("personal_dialog", 0),
+            "remaining_kinds": remaining_kinds,
             "unsupported": len(failed), "unsupported_kinds": sorted({item["kind"] for item in failed.values()}),
             "retention_enabled": retention_enabled, "retention_notice": retention_notice}
+
+
+async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=report, now=utc_now):
+    """Leave only channels explicitly reported inaccessible by Telegram."""
+    targets = []
+    async for dialog in client.iter_dialogs(limit=None, ignore_migrated=True):
+        channel = dialog.entity
+        if (isinstance(channel, types.ChannelForbidden) and channel.broadcast
+                and channel.id != keep_channel_id):
+            targets.append(channel)
+    left = 0
+    already_out = 0
+    failed = Counter()
+    for channel in targets:
+        check_window(job, now())
+        try:
+            await client(functions.channels.LeaveChannelRequest(
+                channel=types.InputChannel(channel.id, channel.access_hash)))
+            left += 1
+        except (errors.UserNotParticipantError, errors.ChannelPrivateError):
+            already_out += 1
+        except errors.FloodWaitError:
+            raise
+        except errors.RPCError as exc:
+            failed[type(exc).__name__] += 1
+        emit({"job_id": job.job_id, "phase": "leaving_unavailable", "left": left,
+              "already_out": already_out, "failed": sum(failed.values())})
+    return {"found": len(targets), "left": left, "already_out": already_out,
+            "failed": sum(failed.values()), "failure_kinds": dict(failed), "verified": not failed}
 
 
 async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramClient,
@@ -272,6 +327,10 @@ async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramCli
                         raise SetupStopped("SAVED_SESSION_NOT_AUTHORIZED")
                     publish({"job_id": job.job_id, "phase": "authorized"})
                     result = await ensure_channel(client, job, emit=publish, now=now)
+                    if job.leave_unavailable_channels:
+                        publish({**result, "phase": "channel_ready"})
+                        result["unavailable_channels"] = await leave_unavailable_channels(
+                            client, job, result["channel_id"], emit=publish, now=now)
                     if job.archive_existing_dialogs:
                         publish({**result, "phase": "channel_ready"})
                         result["archive"] = await archive_other_dialogs(
