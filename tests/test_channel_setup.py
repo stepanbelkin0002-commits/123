@@ -60,6 +60,9 @@ class FakeChannelClient:
         self.archived_ids = set()
         self.folder_edits = []
         self.left_ids = []
+        self.inaccessible_ids = set()
+        self.pinned_ids = set()
+        self.require_unpin_before_archive = False
         self.privacy = types.GlobalPrivacySettings(
             archive_and_mute_new_noncontact_peers=False, keep_archived_unmuted=False,
             keep_archived_folders=False, hide_read_marks=True,
@@ -82,7 +85,8 @@ class FakeChannelClient:
                 continue
             if kwargs.get("folder") == 0 and __import__("telethon").utils.get_peer_id(item) in self.archived_ids:
                 continue
-            yield SimpleNamespace(entity=item)
+            yield SimpleNamespace(entity=item, pinned=item.id in self.pinned_ids,
+                                  folder_id=1 if __import__("telethon").utils.get_peer_id(item) in self.archived_ids else 0)
 
     async def edit_folder(self, peers, folder):
         if folder != 1:
@@ -90,6 +94,8 @@ class FakeChannelClient:
         if not isinstance(peers, list):
             peers = [peers]
         for item in peers:
+            if self.require_unpin_before_archive and item.id in self.pinned_ids:
+                continue
             peer_id = __import__("telethon").utils.get_peer_id(item)
             self.archived_ids.add(peer_id)
             self.folder_edits.append(peer_id)
@@ -98,11 +104,16 @@ class FakeChannelClient:
         if isinstance(request, functions.channels.LeaveChannelRequest):
             target_id = request.channel.channel_id
             target = next(item for item in self.channels if item.id == target_id)
-            if not isinstance(target, types.ChannelForbidden):
+            if not isinstance(target, types.ChannelForbidden) and target.id not in self.inaccessible_ids:
                 raise AssertionError("Must not leave accessible private channels")
             self.channels.remove(target)
             self.left_ids.append(target_id)
             return SimpleNamespace()
+        if isinstance(request, functions.messages.ToggleDialogPinRequest):
+            peer = request.peer.peer
+            peer_id = getattr(peer, "user_id", None) or getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+            self.pinned_ids.discard(peer_id)
+            return True
         if isinstance(request, functions.account.GetGlobalPrivacySettingsRequest):
             return self.privacy
         if isinstance(request, functions.account.SetGlobalPrivacySettingsRequest):
@@ -120,7 +131,9 @@ class FakeChannelClient:
             return SimpleNamespace(chats=[item])
         if isinstance(request, functions.channels.GetFullChannelRequest):
             item = next(item for item in self.channels if item.id == request.channel.id)
-            return SimpleNamespace(chats=[item], full_chat=SimpleNamespace(about=self.descriptions[item.id]))
+            if item.id in self.inaccessible_ids:
+                raise errors.ChannelPrivateError(None)
+            return SimpleNamespace(chats=[item], full_chat=SimpleNamespace(about=self.descriptions.get(item.id, "")))
         if isinstance(request, functions.channels.CheckUsernameRequest):
             self.username_checks.append(request.username)
             if self.flood_on_username:
@@ -294,6 +307,29 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.left_ids, [1003])
         self.assertIn(accessible_private, client.channels)
         self.assertIn(person, client.channels)
+
+    async def test_private_channel_access_is_checked_before_leaving(self):
+        client = FakeChannelClient()
+        inaccessible = channel(1002, title="Private unavailable", creator=False)
+        accessible = channel(1003, title="Private accessible", creator=False)
+        client.channels = [channel(1001), inaccessible, accessible]
+        client.inaccessible_ids.add(1002)
+        result = await leave_unavailable_channels(client, job(), 1001,
+                                                  emit=lambda _: None, now=lambda: NOW)
+        self.assertEqual(result["checked_private"], 2)
+        self.assertEqual(client.left_ids, [1002])
+        self.assertIn(accessible, client.channels)
+
+    async def test_pinned_personal_dialog_is_unpinned_before_archiving(self):
+        client = FakeChannelClient()
+        contact = types.User(id=9001, first_name="Contact", access_hash=123)
+        client.channels = [channel(1001), contact]
+        client.pinned_ids.add(contact.id)
+        client.require_unpin_before_archive = True
+        result = await archive_other_dialogs(client, job(), 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["personal_dialogs_archived"], 1)
+        self.assertNotIn(contact.id, client.pinned_ids)
 
     async def test_combined_setup_leaves_forbidden_and_archives_personal_dialog(self):
         flow, events, clients = FakeFlow(), [], []

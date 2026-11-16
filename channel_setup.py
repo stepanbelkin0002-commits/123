@@ -196,11 +196,12 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
                 and dialog.entity.id == keep_channel_id)
 
     async def main_dialogs():
-        return [dialog async for dialog in client.iter_dialogs(folder=0, limit=None, ignore_migrated=True)]
+        return [dialog async for dialog in client.iter_dialogs(folder=0, limit=None, ignore_migrated=True)
+                if getattr(dialog, "folder_id", None) in (None, 0)]
 
     def peer_kind(peer):
         if isinstance(peer, types.User):
-            if getattr(peer, "self", False):
+            if getattr(peer, "is_self", False):
                 return "saved_messages"
             if peer.id == 777000:
                 return "telegram_service"
@@ -217,6 +218,10 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
     for _ in range(3):
         check_window(job, now())
         dialogs = await main_dialogs()
+        for dialog in dialogs:
+            if not keep(dialog) and getattr(dialog, "pinned", False):
+                await client(functions.messages.ToggleDialogPinRequest(
+                    peer=types.InputDialogPeer(utils.get_input_peer(dialog.entity)), pinned=False))
         targets = [dialog.entity for dialog in dialogs
                    if not keep(dialog) and utils.get_peer_id(dialog.entity) not in failed]
         if not targets:
@@ -234,7 +239,7 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
                         await client.edit_folder(peer, folder=1)
                         moved[utils.get_peer_id(peer)] = peer_kind(peer)
                     except bad_peer_errors as exc:
-                        kind = "saved_messages" if getattr(peer, "self", False) else "unsupported_peer"
+                        kind = "saved_messages" if getattr(peer, "is_self", False) else "unsupported_peer"
                         failed[utils.get_peer_id(peer)] = {"kind": kind, "reason": type(exc).__name__}
             emit({"job_id": job.job_id, "phase": "archiving", "archived": len(moved),
                   "unsupported": len(failed)})
@@ -247,22 +252,43 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
             "personal_dialogs_archived": sum(kind == "personal_dialog" for kind in confirmed.values()),
             "remaining_personal_dialogs": remaining_kinds.get("personal_dialog", 0),
             "remaining_kinds": remaining_kinds,
+            "remaining_pinned": sum(bool(getattr(dialog, "pinned", False)) for dialog in remaining),
             "unsupported": len(failed), "unsupported_kinds": sorted({item["kind"] for item in failed.values()}),
             "retention_enabled": retention_enabled, "retention_notice": retention_notice}
 
 
 async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=report, now=utc_now):
     """Leave only channels explicitly reported inaccessible by Telegram."""
-    targets = []
+    targets = {}
+    checked_private = 0
+    probe_failures = Counter()
     async for dialog in client.iter_dialogs(limit=None, ignore_migrated=True):
         channel = dialog.entity
-        if (isinstance(channel, types.ChannelForbidden) and channel.broadcast
-                and channel.id != keep_channel_id):
-            targets.append(channel)
+        if getattr(channel, "id", None) == keep_channel_id and isinstance(channel, (types.Channel, types.ChannelForbidden)):
+            continue
+        if isinstance(channel, types.ChannelForbidden):
+            targets[channel.id] = channel
+        elif isinstance(channel, types.Channel) and not channel.creator and not channel.username:
+            check_window(job, now())
+            checked_private += 1
+            try:
+                full = await client(functions.channels.GetFullChannelRequest(channel=channel))
+                if any(isinstance(item, types.ChannelForbidden) and item.id == channel.id for item in full.chats):
+                    targets[channel.id] = channel
+            except (errors.ChannelPrivateError, errors.ChannelPublicGroupNaError):
+                targets[channel.id] = channel
+            except errors.FloodWaitError:
+                raise
+            except errors.RPCError as exc:
+                probe_failures[type(exc).__name__] += 1
+            if checked_private % 20 == 0:
+                emit({"job_id": job.job_id, "phase": "checking_private_channels", "checked": checked_private,
+                      "unavailable": len(targets)})
+            await asyncio.sleep(0.15)
     left = 0
     already_out = 0
     failed = Counter()
-    for channel in targets:
+    for channel in targets.values():
         check_window(job, now())
         try:
             await client(functions.channels.LeaveChannelRequest(
@@ -277,7 +303,9 @@ async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=repor
         emit({"job_id": job.job_id, "phase": "leaving_unavailable", "left": left,
               "already_out": already_out, "failed": sum(failed.values())})
     return {"found": len(targets), "left": left, "already_out": already_out,
-            "failed": sum(failed.values()), "failure_kinds": dict(failed), "verified": not failed}
+            "checked_private": checked_private, "probe_failures": dict(probe_failures),
+            "failed": sum(failed.values()), "failure_kinds": dict(failed),
+            "verified": not failed and not probe_failures}
 
 
 async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramClient,
