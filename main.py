@@ -8,6 +8,7 @@ import asyncio
 import base64
 from collections import deque
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -178,6 +179,9 @@ class LoginFlow:
                   "needs_password": self.needs_password,
                   "pending_code": bool(self.phone_code_hash) and self.pending_until > time.monotonic(),
                   "saved": bool(self.settings.encrypted_session) and self.authorized}
+        setup_result = getattr(self, "channel_setup_result", None)
+        if setup_result:
+            result["channel_setup"] = setup_result
         if self.authorized:
             me = await client.get_me()
             if me is None:
@@ -279,8 +283,20 @@ def create_app(settings=None, client_factory=TelegramClient):
 
     @asynccontextmanager
     async def lifespan(_app):
-        yield
-        await flow.close()
+        setup_task = None
+        setup_job = os.getenv("TG_CHANNEL_SETUP_JSON", "").strip()
+        if setup_job:
+            from channel_setup import run_configured_setup
+            setup_task = asyncio.create_task(
+                run_configured_setup(setup_job, flow, decrypt=decrypt_session))
+        try:
+            yield
+        finally:
+            if setup_task is not None:
+                setup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await setup_task
+            await flow.close()
 
     app = FastAPI(title="Personal Telegram login", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
