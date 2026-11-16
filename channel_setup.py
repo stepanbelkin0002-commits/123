@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 from telethon import TelegramClient, errors, functions, types, utils
+from telethon.extensions import html as telegram_html
 from telethon.sessions import StringSession
 
 
@@ -23,9 +24,17 @@ ROLLOUT_DELAY_SECONDS = 150
 PREFIX = "CHANNEL_SETUP_RESULT "
 
 
+class PostEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    message_id: int = Field(gt=0)
+    expected_text: str = Field(min_length=1, max_length=3000)
+    text: str = Field(min_length=1, max_length=3500)
+    parse_mode: Literal["plain", "html"] = "plain"
+
+
 class ChannelJob(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    action: Literal["create_channel", "publish_posts"]
+    action: Literal["create_channel", "publish_posts", "edit_posts"]
     job_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     title: str = Field(min_length=1, max_length=128)
     about: str = Field(min_length=1, max_length=255)
@@ -38,6 +47,7 @@ class ChannelJob(BaseModel):
     keep_archived_on_new_messages: bool = True
     leave_unavailable_channels: bool = False
     posts: list[str] = Field(default_factory=list, max_length=3)
+    edits: list[PostEdit] = Field(default_factory=list, max_length=3)
 
     @field_validator("posts")
     @classmethod
@@ -68,8 +78,16 @@ class ChannelJob(BaseModel):
             raise ValueError("Existing-channel commands must not create another channel")
         if self.action == "publish_posts":
             if (not self.posts or self.allow_create or self.existing_channel_id is None
-                    or self.archive_existing_dialogs or self.leave_unavailable_channels):
+                    or self.archive_existing_dialogs or self.leave_unavailable_channels or self.edits):
                 raise ValueError("Publication requires only an existing owned channel")
+        elif self.action == "edit_posts":
+            if (not self.edits or self.posts or self.allow_create or self.existing_channel_id is None
+                    or self.archive_existing_dialogs or self.leave_unavailable_channels):
+                raise ValueError("Edits require only an existing owned channel")
+            if len({item.message_id for item in self.edits}) != len(self.edits):
+                raise ValueError("Duplicate edited message")
+        elif self.edits:
+            raise ValueError("Edits require an explicit editing command")
         elif self.posts:
             raise ValueError("Posts require an explicit publication command")
         return self
@@ -373,6 +391,38 @@ async def publish_channel_posts(client, job, channel_id, *, emit=report, now=utc
     return {"verified": True, "posts": published}
 
 
+async def edit_channel_posts(client, job, channel_id, *, emit=report, now=utc_now):
+    """Edit only explicitly identified posts whose existing text is known."""
+    target = await client.get_entity(types.PeerChannel(channel_id))
+    if not isinstance(target, types.Channel) or not target.creator or not target.broadcast:
+        raise SetupStopped("EDIT_TARGET_NOT_OWNED")
+    edited = []
+    for edit in job.edits:
+        check_window(job, now())
+        text, entities = (telegram_html.parse(edit.text) if edit.parse_mode == "html"
+                          else (edit.text, []))
+        if not text.strip() or len(text) > 3000:
+            raise SetupStopped("INVALID_EDIT_TEXT")
+        current = await client.get_messages(target, ids=edit.message_id)
+        if current is None:
+            raise SetupStopped("EDIT_MESSAGE_MISSING")
+        reused = current.message == text
+        if not reused:
+            if current.message != edit.expected_text:
+                raise SetupStopped("EDIT_SOURCE_MISMATCH")
+            await client(functions.messages.EditMessageRequest(
+                peer=utils.get_input_peer(target), id=edit.message_id, message=text,
+                entities=entities, no_webpage=True))
+            current = await client.get_messages(target, ids=edit.message_id)
+        if current is None or current.message != text:
+            raise SetupStopped("EDIT_NOT_VERIFIED")
+        item = {"message_id": current.id, "reused": reused,
+                "url": f"https://t.me/{target.username}/{current.id}" if target.username else None}
+        edited.append(item)
+        emit({"job_id": job.job_id, "phase": "edit_verified", **item})
+    return {"verified": True, "posts": edited}
+
+
 async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramClient,
                                sleep=asyncio.sleep, emit=report, now=utc_now):
     """Run once per process after the old Render instance has shut down.
@@ -422,6 +472,9 @@ async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramCli
                     result = await ensure_channel(client, job, emit=publish, now=now)
                     if job.action == "publish_posts":
                         result["publication"] = await publish_channel_posts(
+                            client, job, result["channel_id"], emit=publish, now=now)
+                    if job.action == "edit_posts":
+                        result["edits"] = await edit_channel_posts(
                             client, job, result["channel_id"], emit=publish, now=now)
                     if job.archive_existing_dialogs:
                         publish({**result, "phase": "channel_ready"})

@@ -8,7 +8,7 @@ from telethon import errors, functions, types
 from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
-from channel_setup import (ChannelJob, SetupStopped, archive_other_dialogs,
+from channel_setup import (ChannelJob, SetupStopped, archive_other_dialogs, edit_channel_posts,
                            ensure_channel, leave_unavailable_channels, publish_channel_posts,
                            run_configured_setup)
 from main import Settings
@@ -66,6 +66,7 @@ class FakeChannelClient:
         self.require_unpin_before_archive = False
         self.messages = {}
         self.sent_requests = []
+        self.edit_requests = []
         self.privacy = types.GlobalPrivacySettings(
             archive_and_mute_new_noncontact_peers=False, keep_archived_unmuted=False,
             keep_archived_folders=False, hide_read_marks=True,
@@ -84,7 +85,9 @@ class FakeChannelClient:
     async def get_entity(self, peer):
         return next(item for item in self.channels if item.id == peer.channel_id)
 
-    async def get_messages(self, channel, limit):
+    async def get_messages(self, channel, limit=None, ids=None):
+        if ids is not None:
+            return next((message for message in self.messages.get(channel.id, []) if message.id == ids), None)
         return list(reversed(self.messages.get(channel.id, [])))[:limit]
 
     async def iter_dialogs(self, **kwargs):
@@ -110,6 +113,11 @@ class FakeChannelClient:
             self.folder_edits.append(peer_id)
 
     async def __call__(self, request):
+        if isinstance(request, functions.messages.EditMessageRequest):
+            self.edit_requests.append(request)
+            message = next(item for item in self.messages[request.peer.channel_id] if item.id == request.id)
+            message.message = request.message
+            return SimpleNamespace()
         if isinstance(request, functions.messages.SendMessageRequest):
             self.sent_requests.append(request)
             messages = self.messages.setdefault(request.peer.channel_id, [])
@@ -446,6 +454,43 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
                         {"leave_unavailable_channels": True}, {"existing_channel_id": None}):
             data = dict(action="publish_posts", allow_create=False, existing_channel_id=1001,
                         posts=["Checked city news"])
+            data.update(changes)
+            with self.assertRaises(ValueError):
+                job(**data)
+
+    async def test_edit_reuses_exact_post_id_and_survives_reexecution(self):
+        client = FakeChannelClient()
+        client.channels = [channel(1001, username="che_tam_cheboksary")]
+        client.messages[1001] = [SimpleNamespace(id=3, message="Original checked news")]
+        command = job(action="edit_posts", allow_create=False, existing_channel_id=1001,
+                      edits=[{"message_id": 3, "expected_text": "Original checked news",
+                              "text": '<b>Updated city news</b>\n<a href="https://example.org">Source</a>',
+                              "parse_mode": "html"}])
+        first = await edit_channel_posts(client, command, 1001, emit=lambda _: None, now=lambda: NOW)
+        second = await edit_channel_posts(client, command, 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertTrue(first["verified"])
+        self.assertEqual(first["posts"][0]["message_id"], 3)
+        self.assertTrue(second["posts"][0]["reused"])
+        self.assertEqual(len(client.edit_requests), 1)
+        self.assertEqual(client.sent_requests, [])
+        self.assertEqual(client.messages[1001][0].message, "Updated city news\nSource")
+        self.assertEqual(len(client.edit_requests[0].entities), 2)
+
+    async def test_edit_refuses_to_overwrite_unexpected_existing_text(self):
+        client = FakeChannelClient()
+        client.channels = [channel(1001)]
+        client.messages[1001] = [SimpleNamespace(id=3, message="Another owner's manual revision")]
+        command = job(action="edit_posts", allow_create=False, existing_channel_id=1001,
+                      edits=[{"message_id": 3, "expected_text": "Original checked news", "text": "New text"}])
+        with self.assertRaisesRegex(SetupStopped, "EDIT_SOURCE_MISMATCH"):
+            await edit_channel_posts(client, command, 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertEqual(client.edit_requests, [])
+
+    async def test_edit_command_cannot_mix_publication_or_cleanup(self):
+        for changes in ({"posts": ["New post"]}, {"archive_existing_dialogs": True},
+                        {"leave_unavailable_channels": True}, {"allow_create": True}):
+            data = dict(action="edit_posts", allow_create=False, existing_channel_id=1001,
+                        edits=[{"message_id": 3, "expected_text": "Old", "text": "New"}])
             data.update(changes)
             with self.assertRaises(ValueError):
                 job(**data)
