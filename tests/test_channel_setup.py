@@ -9,7 +9,8 @@ from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
 from channel_setup import (ChannelJob, SetupStopped, archive_other_dialogs,
-                           ensure_channel, leave_unavailable_channels, run_configured_setup)
+                           ensure_channel, leave_unavailable_channels, publish_channel_posts,
+                           run_configured_setup)
 from main import Settings
 
 
@@ -63,6 +64,8 @@ class FakeChannelClient:
         self.inaccessible_ids = set()
         self.pinned_ids = set()
         self.require_unpin_before_archive = False
+        self.messages = {}
+        self.sent_requests = []
         self.privacy = types.GlobalPrivacySettings(
             archive_and_mute_new_noncontact_peers=False, keep_archived_unmuted=False,
             keep_archived_folders=False, hide_read_marks=True,
@@ -77,6 +80,12 @@ class FakeChannelClient:
 
     async def is_user_authorized(self):
         return self.authorized
+
+    async def get_entity(self, peer):
+        return next(item for item in self.channels if item.id == peer.channel_id)
+
+    async def get_messages(self, channel, limit):
+        return list(reversed(self.messages.get(channel.id, [])))[:limit]
 
     async def iter_dialogs(self, **kwargs):
         items = self.channels[:kwargs["limit"]]
@@ -101,6 +110,11 @@ class FakeChannelClient:
             self.folder_edits.append(peer_id)
 
     async def __call__(self, request):
+        if isinstance(request, functions.messages.SendMessageRequest):
+            self.sent_requests.append(request)
+            messages = self.messages.setdefault(request.peer.channel_id, [])
+            messages.append(SimpleNamespace(id=len(messages) + 1, message=request.message))
+            return SimpleNamespace()
         if isinstance(request, functions.channels.LeaveChannelRequest):
             target_id = request.channel.channel_id
             target = next(item for item in self.channels if item.id == target_id)
@@ -302,7 +316,7 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         person = types.User(id=5004, first_name="Personal contact", access_hash=123)
         client.channels = [managed, accessible_private, forbidden, person]
         result = await leave_unavailable_channels(client, job(), 1001,
-                                                  emit=lambda _: None, now=lambda: NOW)
+                                                  emit=lambda _: None, now=lambda: NOW, sleep=no_sleep)
         self.assertTrue(result["verified"])
         self.assertEqual(client.left_ids, [1003])
         self.assertIn(accessible_private, client.channels)
@@ -315,10 +329,48 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         client.channels = [channel(1001), inaccessible, accessible]
         client.inaccessible_ids.add(1002)
         result = await leave_unavailable_channels(client, job(), 1001,
-                                                  emit=lambda _: None, now=lambda: NOW)
+                                                  emit=lambda _: None, now=lambda: NOW, sleep=no_sleep)
         self.assertEqual(result["checked_private"], 2)
         self.assertEqual(client.left_ids, [1002])
         self.assertIn(accessible, client.channels)
+
+    async def test_access_probe_waits_for_telegram_then_preserves_accessible_channel(self):
+        class FloodOnceClient(FakeChannelClient):
+            flooded = False
+
+            async def __call__(self, request):
+                if isinstance(request, functions.channels.GetFullChannelRequest) and not self.flooded:
+                    self.flooded = True
+                    raise errors.FloodWaitError(request, capture=23)
+                return await super().__call__(request)
+
+        client, sleeps, events = FloodOnceClient(), [], []
+        accessible = channel(1002, creator=False)
+        client.channels = [accessible]
+
+        async def record_sleep(seconds):
+            sleeps.append(seconds)
+
+        result = await leave_unavailable_channels(client, job(), 1001, emit=events.append,
+                                                  now=lambda: NOW, sleep=record_sleep)
+        self.assertTrue(result["verified"])
+        self.assertEqual(sleeps, [24, 2])
+        self.assertEqual(client.left_ids, [])
+        self.assertEqual(events[0]["phase"], "waiting_for_telegram")
+
+    async def test_long_access_probe_limit_stops_without_retrying_or_leaving(self):
+        class LimitedClient(FakeChannelClient):
+            async def __call__(self, request):
+                if isinstance(request, functions.channels.GetFullChannelRequest):
+                    raise errors.FloodWaitError(request, capture=120)
+                return await super().__call__(request)
+
+        client = LimitedClient()
+        client.channels = [channel(1002, creator=False)]
+        with self.assertRaises(errors.FloodWaitError):
+            await leave_unavailable_channels(client, job(), 1001, emit=lambda _: None,
+                                             now=lambda: NOW, sleep=no_sleep)
+        self.assertEqual(client.left_ids, [])
 
     async def test_pinned_personal_dialog_is_unpinned_before_archiving(self):
         client = FakeChannelClient()
@@ -368,6 +420,35 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
                                    client_factory=lambda *_args, **_kwargs: self.fail("No client expected"),
                                    sleep=no_sleep, emit=events.append, now=lambda: NOW)
         self.assertEqual(events[-1]["reason"], "SAVED_SESSION_REQUIRED")
+
+    async def test_publication_batch_is_verified_and_reused_after_restart(self):
+        client = FakeChannelClient()
+        client.channels = [channel(1001, username="che_tam_cheboksary")]
+        command = job(action="publish_posts", allow_create=False, existing_channel_id=1001,
+                      posts=["First checked city news\nSource: https://example.org/news"])
+        first = await publish_channel_posts(client, command, 1001, emit=lambda _: None, now=lambda: NOW)
+        second = await publish_channel_posts(client, command, 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertTrue(first["verified"])
+        self.assertEqual(first["posts"][0]["url"], "https://t.me/che_tam_cheboksary/1")
+        self.assertTrue(second["posts"][0]["reused"])
+        self.assertEqual(len(client.sent_requests), 1)
+        self.assertIsInstance(client.sent_requests[0].random_id, int)
+
+    async def test_publication_refuses_another_owners_channel(self):
+        client = FakeChannelClient()
+        client.channels = [channel(1001, creator=False)]
+        with self.assertRaisesRegex(SetupStopped, "PUBLICATION_TARGET_NOT_OWNED"):
+            await publish_channel_posts(client, job(), 1001, emit=lambda _: None, now=lambda: NOW)
+        self.assertEqual(client.sent_requests, [])
+
+    async def test_publication_configuration_cannot_mix_cleanup_or_creation(self):
+        for changes in ({"allow_create": True}, {"archive_existing_dialogs": True},
+                        {"leave_unavailable_channels": True}, {"existing_channel_id": None}):
+            data = dict(action="publish_posts", allow_create=False, existing_channel_id=1001,
+                        posts=["Checked city news"])
+            data.update(changes)
+            with self.assertRaises(ValueError):
+                job(**data)
 
     async def test_runner_keeps_credentials_out_of_results(self):
         events, clients = [], []

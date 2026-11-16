@@ -9,6 +9,7 @@ import asyncio
 from collections import Counter
 from copy import copy
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import re
 from typing import Literal
@@ -24,7 +25,7 @@ PREFIX = "CHANNEL_SETUP_RESULT "
 
 class ChannelJob(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    action: Literal["create_channel"]
+    action: Literal["create_channel", "publish_posts"]
     job_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     title: str = Field(min_length=1, max_length=128)
     about: str = Field(min_length=1, max_length=255)
@@ -36,6 +37,16 @@ class ChannelJob(BaseModel):
     archive_existing_dialogs: bool = False
     keep_archived_on_new_messages: bool = True
     leave_unavailable_channels: bool = False
+    posts: list[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("posts")
+    @classmethod
+    def validate_posts(cls, values):
+        if any(not value.strip() or len(value) > 3000 for value in values):
+            raise ValueError("Invalid post")
+        if len(values) != len(set(values)):
+            raise ValueError("Duplicate post")
+        return values
 
     @field_validator("username_candidates")
     @classmethod
@@ -55,6 +66,12 @@ class ChannelJob(BaseModel):
             raise ValueError("Invalid title")
         if self.existing_channel_id is not None and self.allow_create:
             raise ValueError("Existing-channel commands must not create another channel")
+        if self.action == "publish_posts":
+            if (not self.posts or self.allow_create or self.existing_channel_id is None
+                    or self.archive_existing_dialogs or self.leave_unavailable_channels):
+                raise ValueError("Publication requires only an existing owned channel")
+        elif self.posts:
+            raise ValueError("Posts require an explicit publication command")
         return self
 
 
@@ -257,11 +274,29 @@ async def archive_other_dialogs(client, job, keep_channel_id, *, emit=report, no
             "retention_enabled": retention_enabled, "retention_notice": retention_notice}
 
 
-async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=report, now=utc_now):
+async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=report, now=utc_now,
+                                     sleep=asyncio.sleep):
     """Leave only channels explicitly reported inaccessible by Telegram."""
     targets = {}
     checked_private = 0
     probe_failures = Counter()
+    waited_seconds = 0
+
+    async def probe(channel):
+        nonlocal waited_seconds
+        for attempt in range(4):
+            check_window(job, now())
+            try:
+                return await client(functions.channels.GetFullChannelRequest(channel=channel))
+            except errors.FloodWaitError as exc:
+                delay = max(1, int(exc.seconds)) + 1
+                if attempt == 3 or delay > 61 or waited_seconds + delay > 180:
+                    raise
+                waited_seconds += delay
+                emit({"job_id": job.job_id, "phase": "waiting_for_telegram",
+                      "retry_after": delay, "checked": checked_private})
+                await sleep(delay)
+
     async for dialog in client.iter_dialogs(limit=None, ignore_migrated=True):
         channel = dialog.entity
         if getattr(channel, "id", None) == keep_channel_id and isinstance(channel, (types.Channel, types.ChannelForbidden)):
@@ -272,7 +307,7 @@ async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=repor
             check_window(job, now())
             checked_private += 1
             try:
-                full = await client(functions.channels.GetFullChannelRequest(channel=channel))
+                full = await probe(channel)
                 if any(isinstance(item, types.ChannelForbidden) and item.id == channel.id for item in full.chats):
                     targets[channel.id] = channel
             except (errors.ChannelPrivateError, errors.ChannelPublicGroupNaError):
@@ -284,7 +319,7 @@ async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=repor
             if checked_private % 20 == 0:
                 emit({"job_id": job.job_id, "phase": "checking_private_channels", "checked": checked_private,
                       "unavailable": len(targets)})
-            await asyncio.sleep(0.15)
+            await sleep(2)
     left = 0
     already_out = 0
     failed = Counter()
@@ -306,6 +341,36 @@ async def leave_unavailable_channels(client, job, keep_channel_id, *, emit=repor
             "checked_private": checked_private, "probe_failures": dict(probe_failures),
             "failed": sum(failed.values()), "failure_kinds": dict(failed),
             "verified": not failed and not probe_failures}
+
+
+async def publish_channel_posts(client, job, channel_id, *, emit=report, now=utc_now):
+    """Publish the owner's finite batch, recovering identical existing posts."""
+    target = await client.get_entity(types.PeerChannel(channel_id))
+    if not isinstance(target, types.Channel) or not target.creator or not target.broadcast:
+        raise SetupStopped("PUBLICATION_TARGET_NOT_OWNED")
+    published = []
+    for text in job.posts:
+        check_window(job, now())
+        recent = await client.get_messages(target, limit=30)
+        existing = next((message for message in recent if message.message == text), None)
+        reused = existing is not None
+        if existing is None:
+            # A stable Telegram random_id also prevents a duplicate if the
+            # process restarts after sending but before verifying the result.
+            digest = hashlib.sha256(f"{channel_id}\0{text}".encode("utf-8")).digest()
+            random_id = int.from_bytes(digest[:8], "big", signed=True) or 1
+            await client(functions.messages.SendMessageRequest(
+                peer=utils.get_input_peer(target), message=text, random_id=random_id,
+                no_webpage=True))
+            recent = await client.get_messages(target, limit=30)
+            existing = next((message for message in recent if message.message == text), None)
+        if existing is None:
+            raise SetupStopped("PUBLICATION_NOT_VERIFIED")
+        item = {"message_id": existing.id, "reused": reused,
+                "url": f"https://t.me/{target.username}/{existing.id}" if target.username else None}
+        published.append(item)
+        emit({"job_id": job.job_id, "phase": "post_verified", **item})
+    return {"verified": True, "posts": published}
 
 
 async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramClient,
@@ -349,20 +414,24 @@ async def run_configured_setup(raw, flow, *, decrypt, client_factory=TelegramCli
                 receive_updates=False, catch_up=False, request_retries=0,
                 connection_retries=1, flood_sleep_threshold=0, auto_reconnect=False)
             try:
-                async with asyncio.timeout(180):
+                async with asyncio.timeout(900):
                     await client.connect()
                     if not await client.is_user_authorized():
                         raise SetupStopped("SAVED_SESSION_NOT_AUTHORIZED")
                     publish({"job_id": job.job_id, "phase": "authorized"})
                     result = await ensure_channel(client, job, emit=publish, now=now)
-                    if job.leave_unavailable_channels:
-                        publish({**result, "phase": "channel_ready"})
-                        result["unavailable_channels"] = await leave_unavailable_channels(
+                    if job.action == "publish_posts":
+                        result["publication"] = await publish_channel_posts(
                             client, job, result["channel_id"], emit=publish, now=now)
                     if job.archive_existing_dialogs:
                         publish({**result, "phase": "channel_ready"})
                         result["archive"] = await archive_other_dialogs(
                             client, job, result["channel_id"], emit=publish, now=now)
+                        publish({**result, "phase": "archive_complete"})
+                    if job.leave_unavailable_channels:
+                        publish({**result, "phase": "channel_ready"})
+                        result["unavailable_channels"] = await leave_unavailable_channels(
+                            client, job, result["channel_id"], emit=publish, now=now, sleep=sleep)
                     publish(result)
             finally:
                 await client.disconnect()
