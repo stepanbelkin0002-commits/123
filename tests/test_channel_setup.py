@@ -160,6 +160,16 @@ class ChannelSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second["created"])
         self.assertEqual(len(client.username_updates), 1)
 
+    async def test_recovery_searches_beyond_two_hundred_dialogs(self):
+        client = FakeChannelClient()
+        managed = channel(1001, username="che_tam_cheboksary")
+        client.channels = [types.User(id=10000 + index, first_name="Other", access_hash=123)
+                           for index in range(205)] + [managed]
+        client.descriptions[managed.id] = ABOUT
+        result = await ensure_channel(client, job(), emit=lambda _: None, now=lambda: NOW)
+        self.assertEqual(client.created, 0)
+        self.assertEqual(result["channel_id"], managed.id)
+
     async def test_recovery_reuses_private_channel_after_partial_creation(self):
         client = FakeChannelClient()
         item = channel()

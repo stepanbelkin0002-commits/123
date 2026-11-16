@@ -96,11 +96,7 @@ async def full_channel(client, channel):
 
 async def find_owned_match(client, job):
     matches = []
-    count = 0
-    async for dialog in client.iter_dialogs(limit=201, ignore_migrated=True):
-        count += 1
-        if count > 200:
-            break
+    async for dialog in client.iter_dialogs(limit=None, ignore_migrated=True):
         channel = dialog.entity
         if not recent_owned_broadcast(channel, job):
             continue
@@ -111,8 +107,6 @@ async def find_owned_match(client, job):
         raise SetupStopped("MULTIPLE_MATCHING_CHANNELS")
     if matches:
         return matches[0]
-    if count > 200:
-        raise SetupStopped("RECOVERY_SCAN_LIMIT")
     return None
 
 
