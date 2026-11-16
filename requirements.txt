@@ -1,0 +1,5 @@
+-c constraints.txt
+fastapi==0.163.1
+uvicorn==0.54.0
+Telethon==1.45.0
+cryptography==50.0.2

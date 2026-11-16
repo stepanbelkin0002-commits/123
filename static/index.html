@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="Личное подключение Telegram на своём облачном хостинге">
+  <title>Подключение Telegram</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <span class="mark" aria-hidden="true">↗</span>
+      <div><p class="eyebrow">CHANNEL MANAGER</p><p class="header-title">Твоё подключение</p></div>
+      <span id="status-pill" class="pill">Панель закрыта</span>
+    </header>
+    <section class="intro">
+      <p class="eyebrow">ПЕРВЫЙ ШАГ</p>
+      <h1>Подключи<br>свой Telegram.</h1>
+      <p class="lead">Подтверди вход в свой аккаунт. После подключения здесь появится его статус.</p>
+    </section>
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+    <section id="unlock-section" class="card">
+      <div class="step-label">ДОСТУП К ПАНЕЛИ</div>
+      <h2>Открой свою панель</h2>
+      <p>Введи пароль, который задан в <code>DASHBOARD_PASSWORD</code> в настройках Render.</p>
+      <form id="unlock-form">
+        <label for="panel-password">Пароль панели</label>
+        <input id="panel-password" type="password" autocomplete="current-password" required maxlength="512">
+        <button type="submit">Открыть панель <span aria-hidden="true">→</span></button>
+      </form>
+    </section>
+    <section id="phone-section" class="card" hidden>
+      <div class="step-label">01 / АККАУНТ</div>
+      <h2>Номер телефона</h2>
+      <p>Укажи номер того аккаунта, из которого хочешь управлять каналом.</p>
+      <form id="phone-form">
+        <label for="phone">Номер с кодом страны</label>
+        <input id="phone" type="tel" autocomplete="tel" placeholder="+7 …" required maxlength="32">
+        <button type="submit">Получить код <span aria-hidden="true">→</span></button>
+      </form>
+    </section>
+    <section id="code-section" class="card" hidden>
+      <div class="step-label">02 / ПОДТВЕРЖДЕНИЕ</div>
+      <h2>Подтверди вход</h2>
+      <p>Посмотри код входа в Telegram или в другом канале, который выбрал Telegram. Введи его здесь.</p>
+      <form id="code-form">
+        <label for="code">Код входа</label>
+        <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{3,12}" required maxlength="12">
+        <button type="submit">Подтвердить вход <span aria-hidden="true">→</span></button>
+      </form>
+      <button id="change-phone" class="text-button" type="button">Вернуться к номеру</button>
+    </section>
+    <section id="password-section" class="card" hidden>
+      <div class="step-label">03 / ДВУХЭТАПНАЯ ПРОВЕРКА</div>
+      <h2>Пароль Telegram</h2>
+      <p>В аккаунте включена двухэтапная проверка. Нужен её пароль.</p>
+      <form id="password-form">
+        <label for="telegram-password">Пароль двухэтапной проверки</label>
+        <input id="telegram-password" type="password" autocomplete="off" required maxlength="256">
+        <button type="submit">Завершить вход <span aria-hidden="true">→</span></button>
+      </form>
+    </section>
+    <section id="account-section" class="card success-card" hidden>
+      <div class="step-label">ПОДКЛЮЧЕНО</div>
+      <h2 id="account-name">Аккаунт подключён</h2>
+      <p id="account-detail"></p>
+      <div id="save-required">
+        <h3>Сохрани подключение</h3>
+        <p>Render Free может останавливать приложение. Чтобы после запуска не вводить код заново, сохрани зашифрованную сессию в настройках хостинга.</p>
+        <button id="export-session" type="button">Подготовить сохранение <span aria-hidden="true">↓</span></button>
+      </div>
+      <p id="session-saved" class="saved-note" hidden>Сессия загружена из настроек хостинга и может быть восстановлена после перезапуска.</p>
+      <div id="session-export" hidden>
+        <label for="encrypted-session">Зашифрованная сессия</label>
+        <textarea id="encrypted-session" readonly rows="4" spellcheck="false"></textarea>
+        <button id="copy-session" type="button" class="secondary">Скопировать</button>
+        <ol class="save-steps">
+          <li>Открой свой сервис в Render → <b>Environment</b>.</li>
+          <li>Добавь переменную <code>TG_SESSION_ENCRYPTED</code> со скопированным значением.</li>
+          <li>Сохрани настройки и дождись нового запуска. Пароль <code>DASHBOARD_PASSWORD</code> сохрани прежним.</li>
+        </ol>
+      </div>
+    </section>
+    <div id="session-controls" class="controls" hidden>
+      <button id="refresh" type="button" class="text-button">Обновить статус</button>
+      <button id="lock" type="button" class="text-button">Закрыть панель</button>
+    </div>
+    <footer>Личное подключение через Telegram API.<br>Справка: <a href="https://core.telegram.org/api/auth" target="_blank" rel="noopener noreferrer">авторизация Telegram</a>.</footer>
+  </main>
+</body>
+</html>
