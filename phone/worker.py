@@ -14,6 +14,7 @@ import signal
 import sys
 from time import monotonic, sleep
 from urllib.error import HTTPError
+from uuid import uuid4
 
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.extensions import html as telegram_html
@@ -30,7 +31,8 @@ KEY_FILE = DATA_DIR / "openrouter.key"
 STATE_FILE = DATA_DIR / "news-state.json"
 LOCK_FILE = DATA_DIR / "worker.lock"
 HEALTH_FILE = DATA_DIR / "health.json"
-VERSION = "2026.11.21.4"
+TEST_ALERT_FILE = DATA_DIR / "test-alert.request"
+VERSION = "2026.11.21.5"
 ALREADY_PUBLISHED = {
     "https://pg21.ru/news/132009",
     "https://moygorod.online/society/society_100565.html",
@@ -134,6 +136,36 @@ async def send_post(client, target, key, html):
             random_id=random_id(key), no_webpage=True)), 45)
     except errors.RandomIdDuplicateError:
         log("Telegram уже принял эту запись")
+
+
+async def send_test_alert(client):
+    notice = "В Чувашии объявлена опасность атаки БПЛА"
+    now = now_utc()
+    handle = "id2127305504_gos"
+    event = {"type": "monitoring.hit.created", "data": {
+        "source": {"platform": "max", "username": handle},
+        "message": {"text": notice, "link": f"https://max.ru/{handle}/self-test",
+                    "published_at": now.isoformat()}}}
+    post = select_post(event, now, now)
+    if not post or post.signal != "official:drone" or post.phase != "тревога":
+        log("ТЕСТ — пример не прошёл проверку оповещений")
+        return
+    caption = (f"<b>🧪 ТЕСТ — учебный пример</b>\n\n«{escape(notice)}».\n\n"
+               "Проверка сборщика. Это сообщение не объявляет реальную тревогу.")
+    # Synthetic notices always go to the logged-in account's Saved Messages.
+    await send_post(client, types.InputPeerSelf(), f"test-alert:{uuid4()}", caption)
+    log("ТЕСТ — сообщение доставлено в «Избранное»")
+
+
+async def watch_test_alert(client):
+    while True:
+        try:
+            if client.is_connected() and TEST_ALERT_FILE.is_file():
+                TEST_ALERT_FILE.unlink()
+                await send_test_alert(client)
+        except Exception as exc:
+            log(f"ТЕСТ — {describe_error(exc)}")
+        await asyncio.sleep(2)
 
 
 async def forward_official(client, target, origin, message):
@@ -531,7 +563,7 @@ async def run(mode, settings, key):
             log("MAX — нужен ключ ТелеМакса. Команда: bash start.sh max-key")
         await asyncio.gather(watch_telegram(client, target, state), publish_news(client, target, state, key),
                              watch_max(client, target, state), publish_queue(client, target, state),
-                             heartbeat(client, state))
+                             heartbeat(client, state), watch_test_alert(client))
         return 0
     finally:
         await client.disconnect()
@@ -543,6 +575,17 @@ def acquire_lock(lock):
         return True
     except BlockingIOError:
         return False
+
+
+def request_test_alert():
+    DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with LOCK_FILE.open("a+") as lock:
+        if acquire_lock(lock):
+            log("Сначала запусти сборщик: bash start.sh start")
+            return 1
+        TEST_ALERT_FILE.touch(exist_ok=True)
+    log("ТЕСТ поставлен в очередь. Проверь «Избранное» в Telegram")
+    return 0
 
 
 def is_our_worker(pid, project=None):
@@ -614,7 +657,7 @@ def show_status():
 
 def main():
     parser = argparse.ArgumentParser(description="Автопубликация «Чё там, Чебоксары?»")
-    parser.add_argument("mode", choices=["check", "run", "stop", "status"])
+    parser.add_argument("mode", choices=["check", "run", "stop", "status", "test-alert"])
     parser.add_argument("--project", help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
@@ -622,6 +665,8 @@ def main():
     try:
         if args.mode == "status":
             return show_status()
+        if args.mode == "test-alert":
+            return request_test_alert()
         if args.mode == "stop":
             return stop_worker(args.project)
         settings = load_settings()

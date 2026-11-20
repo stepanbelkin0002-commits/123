@@ -181,6 +181,16 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
                                                     mordovia.title))
         self.assertEqual(state.signals["official:drone"]["phase"], "тревога")
 
+    async def test_synthetic_alert_goes_only_to_saved_messages(self):
+        await worker.send_test_alert(self.client)
+        self.assertEqual(len(self.client.sent), 1)
+        sent = self.client.sent[0]
+        self.assertIsInstance(sent.peer, types.InputPeerSelf)
+        self.assertTrue(sent.message.startswith("🧪 ТЕСТ"))
+        self.assertIn("учебный пример", sent.message)
+        self.assertIn("В Чувашии объявлена опасность атаки БПЛА", sent.message)
+        self.assertFalse(worker.STATE_FILE.exists())
+
     async def test_stop_checks_project_and_never_kills_an_unrelated_process(self):
         worker.LOCK_FILE.write_text("444", encoding="ascii")
         with patch.object(worker, "acquire_lock", side_effect=[False, True]), \

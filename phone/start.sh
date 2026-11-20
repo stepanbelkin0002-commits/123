@@ -65,6 +65,9 @@ EOF
   max-key)
     exec .venv/bin/python -u max_sources.py
     ;;
+  test-alert)
+    exec .venv/bin/python -u worker.py test-alert
+    ;;
   boot)
     boot_dir="$HOME/.termux/boot"
     mkdir -p "$boot_dir"
@@ -79,7 +82,7 @@ EOF
     tail -n 40 "$state_dir/worker.log"
     ;;
   *)
-    echo 'Использование: bash start.sh check | start | restart | stop | status | boot | log | max-key' >&2
+    echo 'Использование: bash start.sh check | start | restart | stop | status | boot | log | max-key | test-alert' >&2
     exit 2
     ;;
 esac
