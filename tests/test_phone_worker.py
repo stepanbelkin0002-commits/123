@@ -1,0 +1,132 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import signal
+import sys
+from tempfile import TemporaryDirectory
+from types import ModuleType, SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+
+PHONE = Path(__file__).resolve().parents[1] / "phone"
+sys.path.insert(0, str(PHONE))
+try:
+    import fcntl
+except ModuleNotFoundError:
+    sys.modules["fcntl"] = ModuleType("fcntl")
+
+import worker
+from telethon import errors, functions, types
+
+
+class StopLoop(Exception):
+    pass
+
+
+class FakeTelegram:
+    def __init__(self, now):
+        self.channel = types.Channel(id=123, access_hash=456, title="City",
+                                     photo=types.ChatPhotoEmpty(), date=now,
+                                     broadcast=True, username="pg21ru")
+        self.media = types.InputMediaPhoto(types.InputPhoto(10, 20, b"ref"))
+        self.message = SimpleNamespace(id=7, date=now, fwd_from=None, noforwards=False,
+            message="В Чебоксарах перекроют Калининский мост на время ремонта",
+            photo=True, video=None, media=self.media)
+        self.sent = []
+
+    async def get_entity(self, handle):
+        return self.channel
+
+    async def get_messages(self, channel, *, ids):
+        return self.message if ids == self.message.id else None
+
+    async def iter_messages(self, channel, *, min_id, reverse, limit):
+        if self.message.id > min_id:
+            yield self.message
+
+    async def __call__(self, request):
+        self.sent.append(request)
+
+
+class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.now = datetime(2026, 11, 21, 9, 0, tzinfo=timezone.utc)
+        for field, value in (("STATE_FILE", self.root / "state.json"), ("DATA_DIR", self.root),
+                             ("LOCK_FILE", self.root / "worker.lock")):
+            patcher = patch.object(worker, field, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(worker, "now_utc", return_value=self.now)
+        self.clock = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = FakeTelegram(self.now)
+        self.target = types.InputPeerChannel(999, 555)
+
+    async def test_story_survives_throttled_poll_and_restart_then_publishes_once(self):
+        state = worker.State()
+        source = next(s for s in worker.SOURCES if s.handle == "pg21ru")
+        state.sources[source.handle] = {"channel_id": 123, "last_id": 6}
+        state.data["last_regular"] = self.now.timestamp()
+        await worker.poll_source(self.client, self.target, state, source, self.client.channel)
+        self.assertEqual(self.client.sent, [])
+        self.assertEqual(state.sources[source.handle]["last_id"], 7)
+        state = worker.State()
+        self.assertEqual(len(state.pending), 1)
+        self.clock.return_value += timedelta(minutes=46)
+        with patch.object(worker.asyncio, "sleep", side_effect=StopLoop):
+            with self.assertRaises(StopLoop):
+                await worker.publish_queue(self.client, self.target, state)
+        self.assertEqual(len(self.client.sent), 1)
+        self.assertIsInstance(self.client.sent[0], functions.messages.SendMediaRequest)
+        self.assertEqual(state.pending, [])
+        state = worker.State()
+        await worker.poll_source(self.client, self.target, state, source, self.client.channel)
+        self.assertEqual(state.pending, [])
+        self.assertEqual(len(self.client.sent), 1)
+
+    async def test_unavailable_preview_falls_back_to_text_without_losing_story(self):
+        state = worker.State()
+        sent = []
+
+        async def reject_preview(request):
+            sent.append(request)
+            if isinstance(request, functions.messages.SendMediaRequest):
+                raise errors.WebpageCurlFailedError(request)
+
+        url = "https://pg21.ru/news/example"
+        title = "В Чебоксарах открыли новый каток"
+        result = await worker.publish_regular(reject_preview, self.target, state, url, title,
+                                             worker.regular_caption(title, url), worker.web_preview(url))
+        self.assertTrue(result)
+        self.assertEqual(len(sent), 2)
+        self.assertIsInstance(sent[1], functions.messages.SendMessageRequest)
+        self.assertEqual(sent[0].random_id, sent[1].random_id)
+        self.assertEqual(worker.State().recent[-1]["url"], url)
+
+    async def test_read_only_status_does_not_need_login_settings(self):
+        with patch.object(worker, "acquire_lock", return_value=True), \
+                patch.object(worker, "load_settings", side_effect=AssertionError("Must not open login settings")):
+            self.assertEqual(worker.show_status(), 1)
+
+    async def test_stop_checks_project_and_never_kills_an_unrelated_process(self):
+        worker.LOCK_FILE.write_text("444", encoding="ascii")
+        with patch.object(worker, "acquire_lock", side_effect=[False, True]), \
+                patch.object(worker, "is_our_worker", return_value=True) as check, \
+                patch.object(worker.os, "kill") as kill:
+            self.assertEqual(worker.stop_worker("/existing/project"), 0)
+            check.assert_called_with(444, "/existing/project")
+            kill.assert_called_once_with(444, signal.SIGTERM)
+        fake_proc = SimpleNamespace(iterdir=lambda: [])
+        with patch.object(worker, "acquire_lock", return_value=False), \
+                patch.object(worker, "is_our_worker", return_value=False), \
+                patch.object(worker, "Path", return_value=fake_proc), patch.object(worker.os, "kill") as kill:
+            self.assertEqual(worker.stop_worker("/existing/project"), 1)
+            kill.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -70,7 +70,7 @@ async def setup():
         await client.connect()
         if not await client.is_user_authorized():
             await client.start(
-                phone=lambda: getpass("Номер Telegram с +7 (ввод скрыт): ").strip(),
+                phone=lambda: getpass("Номер Telegram с кодом страны, начиная с + (ввод скрыт): ").strip(),
                 code_callback=lambda: getpass("Код из Telegram (ввод скрыт): ").strip(),
                 password=lambda: getpass("Пароль двухэтапной проверки (ввод скрыт): "),
                 max_attempts=3)
