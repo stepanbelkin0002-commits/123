@@ -30,7 +30,7 @@ KEY_FILE = DATA_DIR / "openrouter.key"
 STATE_FILE = DATA_DIR / "news-state.json"
 LOCK_FILE = DATA_DIR / "worker.lock"
 HEALTH_FILE = DATA_DIR / "health.json"
-VERSION = "2026.11.21.1"
+VERSION = "2026.11.21.2"
 ALREADY_PUBLISHED = {
     "https://pg21.ru/news/132009",
     "https://moygorod.online/society/society_100565.html",
@@ -305,8 +305,9 @@ async def poll_source(client, target, state, source, channel):
         return
     if entry["channel_id"] != channel.id:
         raise ValueError("Канал источника изменился")
-    messages = [message async for message in client.iter_messages(
-        channel, min_id=entry["last_id"], reverse=True, limit=60)]
+    recent = await client.get_messages(channel, limit=60)
+    messages = sorted((message for message in recent if message.id > entry["last_id"]),
+                      key=lambda message: message.id)
     now = now_utc()
     for message in messages:
         selected = select_message(source, message, now)

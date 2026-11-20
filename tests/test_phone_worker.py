@@ -38,12 +38,10 @@ class FakeTelegram:
     async def get_entity(self, handle):
         return self.channel
 
-    async def get_messages(self, channel, *, ids):
+    async def get_messages(self, channel, *, ids=None, limit=None):
+        if limit:
+            return [self.message]
         return self.message if ids == self.message.id else None
-
-    async def iter_messages(self, channel, *, min_id, reverse, limit):
-        if self.message.id > min_id:
-            yield self.message
 
     async def __call__(self, request):
         self.sent.append(request)
@@ -106,6 +104,15 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(sent[1], functions.messages.SendMessageRequest)
         self.assertEqual(sent[0].random_id, sent[1].random_id)
         self.assertEqual(worker.State().recent[-1]["url"], url)
+
+    async def test_reconnect_skips_days_of_history_and_queues_latest_post(self):
+        state = worker.State()
+        source = next(s for s in worker.SOURCES if s.handle == "pg21ru")
+        state.sources[source.handle] = {"channel_id": 123, "last_id": 1}
+        self.client.message.id = 20_000
+        await worker.poll_source(self.client, self.target, state, source, self.client.channel)
+        self.assertEqual(state.sources[source.handle]["last_id"], 20_000)
+        self.assertEqual(state.pending[0]["message_id"], 20_000)
 
     async def test_read_only_status_does_not_need_login_settings(self):
         with patch.object(worker, "acquire_lock", return_value=True), \
