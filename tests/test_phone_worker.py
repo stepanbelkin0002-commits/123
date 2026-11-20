@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import signal
 import sys
@@ -47,6 +48,9 @@ class FakeTelegram:
     async def __call__(self, request):
         self.sent.append(request)
 
+    def is_connected(self):
+        return True
+
 
 class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -55,7 +59,9 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.now = datetime(2026, 11, 21, 9, 0, tzinfo=timezone.utc)
         for field, value in (("STATE_FILE", self.root / "state.json"), ("DATA_DIR", self.root),
-                             ("LOCK_FILE", self.root / "worker.lock")):
+                             ("LOCK_FILE", self.root / "worker.lock"),
+                             ("TEST_ALERT_FILE", self.root / "test-alert.request"),
+                             ("TEST_ALERT_RESULT", self.root / "test-alert.result")):
             patcher = patch.object(worker, field, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -182,7 +188,14 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.signals["official:drone"]["phase"], "тревога")
 
     async def test_synthetic_alert_goes_only_to_saved_messages(self):
-        await worker.send_test_alert(self.client)
+        worker.TEST_ALERT_FILE.write_text("new-request", encoding="ascii")
+        with patch.object(worker.asyncio, "sleep", side_effect=StopLoop):
+            with self.assertRaises(StopLoop):
+                await worker.watch_test_alert(self.client)
+        result = json.loads(worker.TEST_ALERT_RESULT.read_text(encoding="utf-8"))
+        self.assertEqual(result["id"], "new-request")
+        self.assertTrue(result["ok"])
+        self.assertFalse(worker.TEST_ALERT_FILE.exists())
         self.assertEqual(len(self.client.sent), 1)
         sent = self.client.sent[0]
         self.assertIsInstance(sent.peer, types.InputPeerSelf)

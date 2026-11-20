@@ -45,7 +45,7 @@ fi
 service_dir="${PREFIX:-/data/data/com.termux/files/usr}/var/service/che-tam-news"
 if [ -e "$service_dir/supervise/control" ]; then
   touch "$service_dir/down"
-  sv -w 15 down "$service_dir"
+  sv -w 30 stop "$service_dir"
 fi
 .venv/bin/python "$staging/worker.py" stop --project "$project"
 

@@ -32,7 +32,8 @@ STATE_FILE = DATA_DIR / "news-state.json"
 LOCK_FILE = DATA_DIR / "worker.lock"
 HEALTH_FILE = DATA_DIR / "health.json"
 TEST_ALERT_FILE = DATA_DIR / "test-alert.request"
-VERSION = "2026.11.21.5"
+TEST_ALERT_RESULT = DATA_DIR / "test-alert.result"
+VERSION = "2026.11.21.6"
 ALREADY_PUBLISHED = {
     "https://pg21.ru/news/132009",
     "https://moygorod.online/society/society_100565.html",
@@ -148,23 +149,34 @@ async def send_test_alert(client):
                     "published_at": now.isoformat()}}}
     post = select_post(event, now, now)
     if not post or post.signal != "official:drone" or post.phase != "тревога":
-        log("ТЕСТ — пример не прошёл проверку оповещений")
-        return
+        raise ValueError("Тестовый пример не распознан")
     caption = (f"<b>🧪 ТЕСТ — учебный пример</b>\n\n«{escape(notice)}».\n\n"
                "Проверка сборщика. Это сообщение не объявляет реальную тревогу.")
     # Synthetic notices always go to the logged-in account's Saved Messages.
     await send_post(client, types.InputPeerSelf(), f"test-alert:{uuid4()}", caption)
-    log("ТЕСТ — сообщение доставлено в «Избранное»")
 
 
 async def watch_test_alert(client):
+    claimed = TEST_ALERT_FILE.with_suffix(".processing")
     while True:
-        try:
-            if client.is_connected() and TEST_ALERT_FILE.is_file():
-                TEST_ALERT_FILE.unlink()
-                await send_test_alert(client)
-        except Exception as exc:
-            log(f"ТЕСТ — {describe_error(exc)}")
+        if client.is_connected() and TEST_ALERT_FILE.is_file():
+            try:
+                TEST_ALERT_FILE.replace(claimed)
+                request_id = claimed.read_text(encoding="ascii").strip()
+                claimed.unlink()
+                try:
+                    await send_test_alert(client)
+                    result = {"id": request_id, "ok": True,
+                              "message": "ТЕСТ — Telegram принял сообщение в «Избранное»"}
+                except Exception as exc:
+                    result = {"id": request_id, "ok": False,
+                              "message": f"ТЕСТ — отправка не удалась: {describe_error(exc)}"}
+                temporary = TEST_ALERT_RESULT.with_suffix(".tmp")
+                temporary.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(TEST_ALERT_RESULT)
+                log(result["message"])
+            except (OSError, ValueError) as exc:
+                log(f"ТЕСТ — не удалось обработать запрос: {describe_error(exc)}")
         await asyncio.sleep(2)
 
 
@@ -579,13 +591,21 @@ def acquire_lock(lock):
 
 def request_test_alert():
     DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with LOCK_FILE.open("a+") as lock:
-        if acquire_lock(lock):
-            log("Сначала запусти сборщик: bash start.sh start")
-            return 1
-        TEST_ALERT_FILE.touch(exist_ok=True)
-    log("ТЕСТ поставлен в очередь. Проверь «Избранное» в Telegram")
-    return 0
+    request_id = uuid4().hex
+    temporary = TEST_ALERT_FILE.with_name(f".{request_id}.request")
+    temporary.write_text(request_id, encoding="ascii")
+    temporary.replace(TEST_ALERT_FILE)
+    log("ТЕСТ поставлен в очередь, ожидаю ответ Telegram")
+    deadline = monotonic() + 50
+    while monotonic() < deadline:
+        if TEST_ALERT_RESULT.is_file():
+            result = json.loads(TEST_ALERT_RESULT.read_text(encoding="utf-8"))
+            if result.get("id") == request_id:
+                log(result["message"])
+                return 0 if result["ok"] else 1
+        sleep(1)
+    log("ТЕСТ — ответа пока нет. Посмотри состояние: bash start.sh status")
+    return 1
 
 
 def is_our_worker(pid, project=None):

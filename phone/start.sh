@@ -17,7 +17,7 @@ case "${1:-start}" in
     mkdir -p "$state_dir" "$service_dir"
     touch "$service_dir/down"
     if [ -e "$service_dir/supervise/control" ]; then
-      sv -w 15 down "$service_dir"
+      sv -w 30 stop "$service_dir"
     fi
     .venv/bin/python -u worker.py stop
     cat > "$service_dir/run.new" <<'EOF'
@@ -30,7 +30,9 @@ EOF
     mv -f "$service_dir/run.new" "$service_dir/run"
     cat > "$service_dir/finish" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/sh
-sleep 15
+if [ "${1:-0}" != 0 ] && [ "${2:-0}" != 15 ]; then
+  sleep 15
+fi
 EOF
     chmod 700 "$service_dir/finish"
     termux-wake-lock
@@ -43,14 +45,14 @@ EOF
       sleep 1
     done
     rm -f "$service_dir/down"
-    sv -w 15 up "$service_dir"
+    sv -w 30 start "$service_dir"
     echo 'Служба включена. Команда проверки: bash start.sh status'
     ;;
   stop)
     if [ -d "$service_dir" ]; then
       touch "$service_dir/down"
       if [ -e "$service_dir/supervise/control" ]; then
-        sv -w 15 down "$service_dir"
+        sv -w 30 stop "$service_dir"
       fi
     fi
     exec .venv/bin/python -u worker.py stop
