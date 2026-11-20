@@ -12,7 +12,7 @@ from urllib.request import Request, build_opener
 
 from news import NoRedirect
 from setup import DATA_DIR
-from telegram_sources import local_headline
+from telegram_sources import Source, local_headline, select_alert
 
 
 KEY_FILE = DATA_DIR / "tmaks.key"
@@ -22,7 +22,13 @@ MAX_SOURCES = {
     "id2126003194_gos2": "Станислав Трофимов",
     "id2128054356_gos": "Минобразования Чувашии",
 }
+MAX_ALERT_SOURCES = {
+    "id2127305504_gos": "МЧС Чувашии",
+    "id2130213317_gos": "РСЧС Чувашская Республика",
+}
+MAX_ALERT_AGE = timedelta(minutes=12)
 KEY_FORMAT = re.compile(r"tmk_[A-Za-z0-9_-]+")
+MINISTER_BYLINE = re.compile(r"^\s*Дмитрий Захаров\s*:\s*", re.I)
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,8 @@ class MaxPost:
     published: datetime
     title: str
     has_visual: bool
+    signal: str | None = None
+    phase: str | None = None
 
 
 def get_list(key, endpoint, **params):
@@ -64,9 +72,12 @@ def select_post(event, now, enabled_at):
     if not isinstance(source, dict) or source.get("platform") != "max" or not isinstance(message, dict):
         return None
     handle = source.get("username")
-    if not isinstance(handle, str) or handle.casefold().lstrip("@") not in MAX_SOURCES:
+    if not isinstance(handle, str):
         return None
     handle = handle.casefold().lstrip("@")
+    name = MAX_ALERT_SOURCES.get(handle) or MAX_SOURCES.get(handle)
+    if name is None:
+        return None
     link, timestamp, text = (message.get(field) for field in ("link", "published_at", "text"))
     if not all(isinstance(value, str) for value in (link, timestamp, text)):
         return None
@@ -81,11 +92,18 @@ def select_post(event, now, enabled_at):
     if (published.tzinfo is None or published < enabled_at
             or not now - timedelta(hours=6) <= published <= now + timedelta(seconds=30)):
         return None
+    if handle in MAX_ALERT_SOURCES and now - published <= MAX_ALERT_AGE:
+        selected = select_alert(Source(handle, name, "official", MAX_INTERVAL), text)
+        if selected:
+            _, title, signal, phase = selected
+            return MaxPost(name, link, published, title, False, signal, phase)
+    if handle == "id2128054356_gos":
+        text = MINISTER_BYLINE.sub("", text, count=1)
     title = local_headline(text)
     media = message.get("media")
     has_visual = isinstance(media, list) and any(isinstance(item, dict)
         and item.get("type") in ("photo", "video") for item in media)
-    return MaxPost(MAX_SOURCES[handle], link, published, title, has_visual) if title else None
+    return MaxPost(name, link, published, title, has_visual) if title else None
 
 
 def save_key():
@@ -110,7 +128,7 @@ def save_key():
     enabled = sum(rule.get("enabled") is True for rule in rules)
     print(f"Ключ принят. Активных правил мониторинга в ТелеМаксе: {enabled}.")
     if not enabled:
-        print("Добавь правила мониторинга для двух источников MAX в ТелеМаксе.")
+        print("Добавь правила мониторинга для источников MAX в ТелеМаксе.")
     print("Запущенный сборщик подхватит ключ автоматически.")
     return 0
 

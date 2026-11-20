@@ -17,6 +17,7 @@ except ModuleNotFoundError:
     sys.modules["fcntl"] = ModuleType("fcntl")
 
 import worker
+from max_sources import select_post
 from telethon import errors, functions, types
 
 
@@ -118,6 +119,42 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(worker, "acquire_lock", return_value=True), \
                 patch.object(worker, "load_settings", side_effect=AssertionError("Must not open login settings")):
             self.assertEqual(worker.show_status(), 1)
+
+    async def test_max_accepts_only_fresh_alerts_from_the_official_sources(self):
+        handle = "id2127305504_gos"
+        url = f"https://max.ru/{handle}/alert"
+        alert = {"type": "monitoring.hit.created", "data": {
+            "source": {"platform": "max", "username": handle},
+            "message": {"text": "В Чувашской Республике объявлена опасность атаки БПЛА!",
+                        "link": url,
+                        "published_at": (self.now - timedelta(minutes=9)).isoformat()}}}
+        enabled = self.now - timedelta(hours=1)
+        post = select_post(alert, self.now, enabled)
+        self.assertEqual((post.signal, post.phase), ("official:drone", "тревога"))
+        self.assertIsNone(select_post(alert, self.now + timedelta(minutes=4), enabled))
+        alert["data"]["source"]["username"] = "channel_radar_russia_bpla"
+        alert["data"]["message"]["link"] = "https://max.ru/channel_radar_russia_bpla/alert"
+        self.assertIsNone(select_post(alert, self.now, enabled))
+
+    async def test_delayed_max_alert_cannot_override_newer_all_clear(self):
+        state = worker.State()
+        state.signals["official:drone"] = {"time": self.now.timestamp(), "phase": "отбой"}
+        published = self.now - timedelta(minutes=3)
+        result = await worker.publish_alert(self.client, self.target, state, "official:drone",
+                                            "тревога", published, "https://max.ru/example/alert", "alert")
+        self.assertFalse(result)
+        self.assertEqual(self.client.sent, [])
+
+    async def test_max_recognizes_a_news_headline_after_the_ministers_byline(self):
+        handle = "id2128054356_gos"
+        event = {"type": "monitoring.hit.created", "data": {
+            "source": {"platform": "max", "username": handle},
+            "message": {"text": "Дмитрий Захаров:\nВ Чебоксарах открыли новую школу.",
+                        "link": f"https://max.ru/{handle}/school",
+                        "published_at": self.now.isoformat()}}}
+        post = select_post(event, self.now, self.now - timedelta(minutes=1))
+        self.assertEqual(post.title, "В Чебоксарах открыли новую школу.")
+        self.assertIsNone(post.signal)
 
     async def test_stop_checks_project_and_never_kills_an_unrelated_process(self):
         worker.LOCK_FILE.write_text("444", encoding="ascii")

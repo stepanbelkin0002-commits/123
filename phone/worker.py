@@ -19,7 +19,7 @@ from telethon import TelegramClient, errors, functions, types, utils
 from telethon.extensions import html as telegram_html
 from telethon.network.connection import ConnectionTcpObfuscated
 
-from max_sources import KEY_FILE as MAX_KEY_FILE, MAX_INTERVAL, fetch_events, select_post
+from max_sources import KEY_FILE as MAX_KEY_FILE, MAX_ALERT_AGE, MAX_INTERVAL, fetch_events, select_post
 from news import DraftError, FEEDS, MSK, fetch_feed, make_draft, select_articles, similar_title
 from news_media import fetch_visual
 from setup import CHANNEL_ID, CHANNEL_USERNAME, DATA_DIR, load_settings, valid_api_pair
@@ -30,7 +30,7 @@ KEY_FILE = DATA_DIR / "openrouter.key"
 STATE_FILE = DATA_DIR / "news-state.json"
 LOCK_FILE = DATA_DIR / "worker.lock"
 HEALTH_FILE = DATA_DIR / "health.json"
-VERSION = "2026.11.21.2"
+VERSION = "2026.11.21.3"
 ALREADY_PUBLISHED = {
     "https://pg21.ru/news/132009",
     "https://moygorod.online/society/society_100565.html",
@@ -69,6 +69,7 @@ class State:
         self.sources = self.data.setdefault("sources", {})
         self.recent = self.data.setdefault("recent", [])
         self.signals = self.data.setdefault("signals", {})
+        self.alert_lock = asyncio.Lock()
         self.leads = self.data.setdefault("leads", [])
         self.pending = self.data.setdefault("pending", [])
         self.regular_lock = asyncio.Lock()
@@ -143,6 +144,29 @@ async def forward_official(client, target, origin, message):
             to_peer=utils.get_input_peer(target))), 45)
     except errors.RandomIdDuplicateError:
         log("Telegram уже принял это сообщение")
+
+
+async def publish_alert(client, target, state, signal, phase, published, url, caption,
+                        *, telegram_message=None, telegram_channel=None):
+    async with state.alert_lock:
+        previous = state.signals.get(signal, {})
+        timestamp = published.timestamp()
+        last_time = previous.get("time", 0)
+        if timestamp <= last_time or (phase == previous.get("phase") and timestamp - last_time < 300):
+            return False
+        if telegram_message is None:
+            if now_utc() - published > MAX_ALERT_AGE:
+                return False
+            await send_post(client, target, url, caption)
+        else:
+            try:
+                await forward_official(client, target, telegram_channel, telegram_message)
+            except errors.ChatForwardsRestrictedError:
+                await send_post(client, target, url, caption)
+        state.signals[signal] = {"time": timestamp, "phase": phase}
+        state.save()
+        log(f"Официальное сообщение опубликовано — {url}")
+        return True
 
 
 async def publish_regular(client, target, state, url, title, caption, media):
@@ -318,19 +342,10 @@ async def poll_source(client, target, state, source, channel):
                 state.remember_lead(title, now)
                 state.queue_story(source, channel, message, title)
             elif kind == "official":
-                # Several agencies can report the same change within a few minutes.
-                previous = state.signals.get(signal, {})
-                timestamp = message.date.timestamp()
-                if (timestamp > previous.get("time", 0)
-                        and (phase != previous.get("phase") or timestamp - previous.get("time", 0) >= 300)):
-                    try:
-                        await forward_official(client, target, channel, message)
-                    except errors.ChatForwardsRestrictedError:
-                        text = (f"<b>{escape(title)}</b>\n\n"
-                                f'<a href="{url}">{escape(source.name)}</a> · {post_time(message)}')
-                        await send_post(client, target, url, text)
-                    state.signals[signal] = {"time": timestamp, "phase": phase}
-                    log(f"Официальное сообщение опубликовано — {url}")
+                text = (f"<b>{escape(title)}</b>\n\n"
+                        f'<a href="{url}">{escape(source.name)}</a> · {post_time(message)}')
+                await publish_alert(client, target, state, signal, phase, message.date, url, text,
+                                    telegram_message=message, telegram_channel=channel)
             elif now.timestamp() - state.signals.get(signal, 0) >= 300:
                 text = (f"<b>{escape(title)}</b>\n\n"
                         f"Сообщение мониторингового канала · {post_time(message)}\n\n"
@@ -441,12 +456,25 @@ async def watch_max(client, target, state):
                 if not connected:
                     log("MAX — лента ТелеМакса доступна")
                     connected = True
-                for event in events:
+                posts = [select_post(event, now_utc(), enabled_at) for event in events]
+                latest_alerts = {}
+                for post in posts:
+                    if post and post.signal:
+                        latest = latest_alerts.get(post.signal)
+                        if latest is None or post.published > latest.published:
+                            latest_alerts[post.signal] = post
+                for post in sorted(latest_alerts.values(), key=lambda item: item.published):
+                    stamp = post.published.astimezone(MSK).strftime("%d.%m в %H:%M мск")
+                    caption = (f"<b>{escape(post.title)}</b>\n\n"
+                               f'<a href="{escape(post.url, quote=True)}">{escape(post.source)} в MAX</a>'
+                               f" · {stamp}")
+                    await publish_alert(client, target, state, post.signal, post.phase,
+                                        post.published, post.url, caption)
+                for event, post in zip(events, posts):
                     cursor = event.get("cursor")
                     if not isinstance(cursor, str) or not 1 <= len(cursor) <= 256:
                         raise ValueError("Нет курсора события ТелеМакса")
-                    post = select_post(event, now_utc(), enabled_at)
-                    if post:
+                    if post and not post.signal:
                         state.remember_lead(post.title, now_utc())
                         if post.has_visual and state.regular_due(now_utc()):
                             if await asyncio.to_thread(fetch_visual, post.url):
