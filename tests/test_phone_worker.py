@@ -156,6 +156,31 @@ class PhoneWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(post.title, "В Чебоксарах открыли новую школу.")
         self.assertIsNone(post.signal)
 
+    async def test_neighbor_alerts_keep_separate_regions_and_skip_speculation(self):
+        def selected(handle, body):
+            event = {"type": "monitoring.hit.created", "data": {
+                "source": {"platform": "max", "username": handle},
+                "message": {"text": body, "link": f"https://max.ru/{handle}/example",
+                            "published_at": self.now.isoformat()}}}
+            return select_post(event, self.now, self.now - timedelta(minutes=1))
+
+        tatarstan = selected("id1660025250_gos", "Внимание! В Татарстане введён режим «Беспилотная опасность».")
+        mordovia = selected("officialmordovia", "В Мордовии отбой сигнала «Беспилотная опасность».")
+        nizhny = selected("id5260494537_gos", "Режим ракетной опасности на территории Нижегородской области объявлен.")
+        self.assertEqual((tatarstan.signal, tatarstan.phase), ("official:tatarstan:drone", "тревога"))
+        self.assertEqual((mordovia.signal, mordovia.phase), ("official:mordovia:drone", "отбой"))
+        self.assertEqual(nizhny.signal, "official:nizhny-novgorod:rocket")
+        self.assertIn("Соседние регионы · Татарстан", tatarstan.title)
+        self.assertIsNone(selected("id1660025250_gos", "В Чувашии объявили опасность атаки БПЛА."))
+        self.assertIsNone(selected("officialmordovia", "В Мордовии возможна ракетная опасность."))
+        self.assertIsNone(selected("officialmordovia", "В Мордовии объявлена учебная ракетная опасность."))
+        state = worker.State()
+        state.signals["official:drone"] = {"time": self.now.timestamp(), "phase": "тревога"}
+        self.assertTrue(await worker.publish_alert(self.client, self.target, state, mordovia.signal,
+                                                    mordovia.phase, mordovia.published, mordovia.url,
+                                                    mordovia.title))
+        self.assertEqual(state.signals["official:drone"]["phase"], "тревога")
+
     async def test_stop_checks_project_and_never_kills_an_unrelated_process(self):
         worker.LOCK_FILE.write_text("444", encoding="ascii")
         with patch.object(worker, "acquire_lock", side_effect=[False, True]), \

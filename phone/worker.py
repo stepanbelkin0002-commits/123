@@ -30,7 +30,7 @@ KEY_FILE = DATA_DIR / "openrouter.key"
 STATE_FILE = DATA_DIR / "news-state.json"
 LOCK_FILE = DATA_DIR / "worker.lock"
 HEALTH_FILE = DATA_DIR / "health.json"
-VERSION = "2026.11.21.3"
+VERSION = "2026.11.21.4"
 ALREADY_PUBLISHED = {
     "https://pg21.ru/news/132009",
     "https://moygorod.online/society/society_100565.html",

@@ -12,7 +12,7 @@ from urllib.request import Request, build_opener
 
 from news import NoRedirect
 from setup import DATA_DIR
-from telegram_sources import Source, local_headline, select_alert
+from telegram_sources import CLAUSES, EXERCISE, START, STOP, Source, local_headline, select_alert
 
 
 KEY_FILE = DATA_DIR / "tmaks.key"
@@ -26,6 +26,22 @@ MAX_ALERT_SOURCES = {
     "id2127305504_gos": "МЧС Чувашии",
     "id2130213317_gos": "РСЧС Чувашская Республика",
 }
+NEIGHBOR_SOURCES = {
+    "id1660025250_gos": ("РСЧС Татарстана", "Татарстан", "tatarstan", r"\bтатарстан[аеу]?\b"),
+    "officialmordovia": ("Республика Мордовия", "Мордовия", "mordovia", r"\bмордов(?:ия|ии|ию|ией)\b"),
+    "id5260494537_gos": ("РСЧС Нижегородской области", "Нижегородская область", "nizhny-novgorod",
+                          r"\bнижегородск\w+\s+област\w*\b"),
+}
+NEIGHBOR_HAZARDS = {
+    "drone": ("беспилотная опасность", r"\b(?:беспилотн\w+\s+опасност\w*|"
+              r"(?:опасност\w*|угроз\w*)\s+(?:атаки\s+)?бпла)\b"),
+    "rocket": ("ракетная опасность", r"\bракетн\w+\s+опасност\w*\b"),
+}
+NEIGHBOR_NON_NOTICE = re.compile(
+    r"\b(?:не|возможно|возможн\w+|может|риск\w*|вероятност\w*|ожида\w*|вчера|"
+    r"памятк\w*|учени\w*|проверк\w*|при угрозе|в случае|напоминаем|"
+    r"фиксац\w*|транзит\w*|в направлении|в сторону)\b", re.I,
+)
 MAX_ALERT_AGE = timedelta(minutes=12)
 KEY_FORMAT = re.compile(r"tmk_[A-Za-z0-9_-]+")
 MINISTER_BYLINE = re.compile(r"^\s*Дмитрий Захаров\s*:\s*", re.I)
@@ -62,6 +78,25 @@ def fetch_events(key, cursor):
     return get_list(key, "events", **params)
 
 
+def neighbor_notice(neighbor, text):
+    name, region, region_id, area = neighbor
+    notices = []
+    for clause in CLAUSES.split(" ".join(text[:350].split())):
+        if not re.search(area, clause, re.I) or EXERCISE.search(clause) or NEIGHBOR_NON_NOTICE.search(clause):
+            continue
+        started, stopped = START.search(clause), STOP.search(clause)
+        if bool(started) == bool(stopped):
+            continue
+        for hazard, (label, pattern) in NEIGHBOR_HAZARDS.items():
+            if re.search(pattern, clause, re.I):
+                phase = "отбой" if stopped else "тревога"
+                status = "отбой" if stopped else "действует"
+                title = f"Соседние регионы · {region}\n{label.capitalize()} — {status}"
+                notices.append((title, f"official:{region_id}:{hazard}", phase))
+    # A single post must unambiguously announce one status and one hazard.
+    return (name, *notices[0]) if len(notices) == 1 else None
+
+
 def select_post(event, now, enabled_at):
     if event.get("type") != "monitoring.hit.created":
         return None
@@ -75,7 +110,8 @@ def select_post(event, now, enabled_at):
     if not isinstance(handle, str):
         return None
     handle = handle.casefold().lstrip("@")
-    name = MAX_ALERT_SOURCES.get(handle) or MAX_SOURCES.get(handle)
+    neighbor = NEIGHBOR_SOURCES.get(handle)
+    name = neighbor[0] if neighbor else MAX_ALERT_SOURCES.get(handle) or MAX_SOURCES.get(handle)
     if name is None:
         return None
     link, timestamp, text = (message.get(field) for field in ("link", "published_at", "text"))
@@ -91,6 +127,14 @@ def select_post(event, now, enabled_at):
         return None
     if (published.tzinfo is None or published < enabled_at
             or not now - timedelta(hours=6) <= published <= now + timedelta(seconds=30)):
+        return None
+    if neighbor:
+        if now - published > MAX_ALERT_AGE:
+            return None
+        official = neighbor_notice(neighbor, text)
+        if official:
+            name, title, signal, phase = official
+            return MaxPost(name, link, published, title, False, signal, phase)
         return None
     if handle in MAX_ALERT_SOURCES and now - published <= MAX_ALERT_AGE:
         selected = select_alert(Source(handle, name, "official", MAX_INTERVAL), text)
